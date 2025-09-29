@@ -1,6 +1,7 @@
-flask
+Flask
 pandas
 scikit-learn
-gunicorn
 Flask-SQLAlchemy
 Flask-Login
+Flask-Cors
+waitress
