@@ -2,12 +2,12 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import pickle
 import pandas as pd
-import numpy as np
+import html
 
 app = Flask(__name__)
 CORS(app)
 
-# Load the trained Decision Tree model
+# --- MODEL AND DATA LOADING ---
 try:
     with open('dt_model.pkl', 'rb') as f:
         model = pickle.load(f)
@@ -16,135 +16,115 @@ except Exception as e:
     print(f"❌ Error loading model: {e}")
     model = None
 
-# Load the anime dataset
+try:
+    with open('model_columns.pkl', 'rb') as f:
+        model_columns = pickle.load(f)
+    print("✅ Model columns loaded successfully!")
+except Exception as e:
+    print(f"❌ Error loading model columns: {e}")
+    model_columns = None
+
 try:
     df = pd.read_csv('anime.csv')
-    print(f"✅ Dataset loaded: {len(df)} animes")
+    df['name'] = df['name'].apply(html.unescape)
+    df.dropna(subset=['rating', 'genre', 'members'], inplace=True)
+    df['primary_genre'] = df['genre'].apply(lambda x: x.split(',')[0])
+    print(f"✅ Dataset loaded and cleaned: {len(df)} animes")
 except Exception as e:
     print(f"❌ Error loading dataset: {e}")
     df = None
 
-# Get unique values for dropdowns
-def get_unique_values():
-    if df is None:
-        return {
-            'genres': [],
-            'types': [],
-            'ratings': []
-        }
-    
-    # Extract unique genres (assuming genres are comma-separated)
-    all_genres = set()
-    if 'genre' in df.columns:
-        for genres in df['genre'].dropna():
-            if isinstance(genres, str):
-                all_genres.update([g.strip() for g in genres.split(',')])
-    
-    # Get unique types
-    types = df['type'].dropna().unique().tolist() if 'type' in df.columns else []
-    
-    # Create rating ranges
-    ratings = ['All', '1-3', '3-5', '5-7', '7-9', '9-10']
-    
-    return {
-        'genres': sorted(list(all_genres)),
-        'types': sorted(types),
-        'ratings': ratings
-    }
-
+# -------------------------------------------------------------------
+# --- START: UPDATED FILTERS SECTION ---
+# -------------------------------------------------------------------
 @app.route('/api/filters', methods=['GET'])
 def get_filters():
-    """Get available filter options"""
+    """Get the specific lists of genres, types, and single ratings."""
+    if df is None:
+        return jsonify({'error': 'Dataset not loaded'}), 500
+
     try:
-        filters = get_unique_values()
-        return jsonify(filters), 200
+        genre_list = [
+            'Action', 'Adventure', 'Comedy', 'Drama', 'Fantasy', 'Horror',
+            'Mystery', 'Romance', 'Sci-Fi', 'Slice of Life', 'Sports',
+            'Supernatural', 'Thriller'
+        ]
+        type_list = ['TV', 'Movie', 'OVA', 'Special']
+        
+        # Use a list of single numbers for the minimum rating
+        ratings = [9, 8, 7, 6, 5, 4, 3, 2, 1]
+
+        return jsonify({
+            'genres': genre_list,
+            'types': type_list,
+            'ratings': ratings
+        }), 200
+
     except Exception as e:
+        print(f"Error in /api/filters: {e}")
         return jsonify({'error': str(e)}), 500
+# -------------------------------------------------------------------
+# --- END: UPDATED FILTERS SECTION ---
+# -------------------------------------------------------------------
+
 
 @app.route('/api/recommend', methods=['POST'])
 def recommend():
     """Get anime recommendations based on user preferences"""
+    if df is None or model is None or model_columns is None:
+        return jsonify({'error': 'Server is not ready: model or data not loaded'}), 500
+
     try:
         data = request.json
-        genre = data.get('genre')
-        anime_type = data.get('type')
-        rating_range = data.get('rating')
-        
-        if df is None:
-            return jsonify({'error': 'Dataset not loaded'}), 500
-        
-        # Filter the dataset based on user input
+        genre = data.get('genre', 'All')
+        anime_type = data.get('type', 'All')
+        # Get the single rating value from the frontend
+        rating_value = data.get('rating')
+
         filtered_df = df.copy()
-        
-        # Filter by genre
+
         if genre and genre != 'All':
             filtered_df = filtered_df[filtered_df['genre'].str.contains(genre, case=False, na=False)]
-        
-        # Filter by type
+
         if anime_type and anime_type != 'All':
             filtered_df = filtered_df[filtered_df['type'] == anime_type]
+
+        # Filter by minimum rating if a value is provided by the user
+        if rating_value:
+            min_rating = float(rating_value)
+            filtered_df = filtered_df[filtered_df['rating'] >= min_rating]
         
-        # Filter by rating range
-        if rating_range and rating_range != 'All':
-            if 'rating' in filtered_df.columns:
-                if rating_range == '1-3':
-                    filtered_df = filtered_df[(filtered_df['rating'] >= 1) & (filtered_df['rating'] < 3)]
-                elif rating_range == '3-5':
-                    filtered_df = filtered_df[(filtered_df['rating'] >= 3) & (filtered_df['rating'] < 5)]
-                elif rating_range == '5-7':
-                    filtered_df = filtered_df[(filtered_df['rating'] >= 5) & (filtered_df['rating'] < 7)]
-                elif rating_range == '7-9':
-                    filtered_df = filtered_df[(filtered_df['rating'] >= 7) & (filtered_df['rating'] < 9)]
-                elif rating_range == '9-10':
-                    filtered_df = filtered_df[(filtered_df['rating'] >= 9) & (filtered_df['rating'] <= 10)]
-        
-        # If model exists and we have features, use it for ranking
-        if model is not None and len(filtered_df) > 0:
-            # Prepare features for prediction (adjust based on your model's features)
-            # This is a placeholder - adjust according to your actual model features
-            try:
-                # Sort by rating if available, otherwise random
-                if 'rating' in filtered_df.columns:
-                    filtered_df = filtered_df.sort_values('rating', ascending=False)
-                else:
-                    filtered_df = filtered_df.sample(frac=1)
-            except:
-                pass
-        
-        # Get top recommendations (limit to 20)
-        recommendations = filtered_df.head(20)
-        
-        # Prepare response
+        if filtered_df.empty:
+            return jsonify({'recommendations': [], 'count': 0}), 200
+
+        X_to_predict = filtered_df[['primary_genre', 'members']]
+        X_to_predict_encoded = pd.get_dummies(X_to_predict, columns=['primary_genre'])
+        X_to_predict_aligned = X_to_predict_encoded.reindex(columns=model_columns, fill_value=0)
+
+        predictions = model.predict(X_to_predict_aligned)
+        filtered_df['prediction'] = predictions
+
+        recommendations = filtered_df[filtered_df['prediction'] == 1]
+        recommendations = recommendations.sort_values(by='rating', ascending=False)
+        final_recommendations = recommendations.head(20)
+
         result = []
-        for _, row in recommendations.iterrows():
-            anime_info = {
-                'name': row.get('name', 'Unknown'),
-                'genre': row.get('genre', 'Unknown'),
-                'type': row.get('type', 'Unknown'),
-                'episodes': int(row.get('episodes', 0)) if pd.notna(row.get('episodes')) else 0,
-                'rating': float(row.get('rating', 0)) if pd.notna(row.get('rating')) else 0,
-                'members': int(row.get('members', 0)) if pd.notna(row.get('members')) else 0
-            }
-            result.append(anime_info)
-        
+        for _, row in final_recommendations.iterrows():
+            result.append({
+                'name': row.get('name', 'N/A'),
+                'genre': row.get('genre', 'N/A'),
+                'type': row.get('type', 'N/A'),
+                'rating': float(row.get('rating', 0)),
+            })
+            
         return jsonify({
             'recommendations': result,
             'count': len(result)
         }), 200
         
     except Exception as e:
-        print(f"Error in recommend: {e}")
+        print(f"Error in /api/recommend: {e}")
         return jsonify({'error': str(e)}), 500
-
-@app.route('/api/health', methods=['GET'])
-def health():
-    """Health check endpoint"""
-    return jsonify({
-        'status': 'healthy',
-        'model_loaded': model is not None,
-        'dataset_loaded': df is not None,
-        'dataset_size': len(df) if df is not None else 0
-    }), 200
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
